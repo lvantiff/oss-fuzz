@@ -1,0 +1,97 @@
+name: packaging fuzz test (fork-only)
+
+on:
+  push:
+    branches: [ci-packaging-test2]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: before
+            ref: master
+          - label: after
+            ref: ci-packaging-test2
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+
+      - name: Build image
+        run: python3 infra/helper.py build_image --pull packaging
+
+      - name: Build fuzzers (address)
+        run: python3 infra/helper.py build_fuzzers --sanitizer address packaging
+
+      - name: Check build
+        run: python3 infra/helper.py check_build --sanitizer address packaging
+
+      - name: Run each fuzzer for 10 minutes (in parallel)
+        run: |
+          mkdir -p fuzzlogs
+          FUZZERS=$(ls projects/packaging/fuzz_*.py | xargs -n1 basename | sed 's/\.py$//')
+          echo "Fuzzers: $FUZZERS"
+          for f in $FUZZERS; do
+            mkdir -p build/corpus/packaging/$f
+            ( python3 infra/helper.py run_fuzzer --sanitizer address \
+                --corpus-dir build/corpus/packaging/$f packaging $f \
+                -- -max_total_time=600 -rss_limit_mb=2560 -timeout=25 \
+                > fuzzlogs/$f.log 2>&1; echo "$f exit=$?" >> fuzzlogs/status.txt ) &
+          done
+          wait
+          cat fuzzlogs/status.txt
+          for f in $FUZZERS; do
+            echo "===== $f (tail) ====="
+            tail -n 60 fuzzlogs/$f.log
+            echo "corpus files: $(ls build/corpus/packaging/$f | wc -l)"
+          done
+
+      - name: Build fuzzers (coverage)
+        run: python3 infra/helper.py build_fuzzers --sanitizer coverage packaging
+
+      - name: Coverage report
+        run: |
+          python3 infra/helper.py coverage --no-corpus-download --no-serve packaging || true
+          S=$(sudo find build/out/packaging -name summary.json | head -1)
+          echo "summary: $S"
+          sudo python3 - "$S" <<'EOF'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          t = d["data"][0]["totals"]["lines"]
+          print(f"LINE COVERAGE ({'${{ matrix.label }}'}): {t['covered']}/{t['count']} = {100.0 * t['covered'] / max(t['count'], 1):.2f}%")
+          files = d["data"][0].get("files", [])
+          if isinstance(files, dict):
+              files = [dict(v, filename=k) for k, v in files.items()]
+          for f in files:
+              if not isinstance(f, dict):
+                  continue
+              l = f.get("summary", {}).get("lines", {})
+              name = f.get("filename", "?")
+              if "site-packages/packaging/" in name and l:
+                  print(f"  {l['covered']:5d}/{l['count']:5d} {100.0 * l['covered'] / max(l['count'], 1):6.2f}%  {name}")
+          EOF
+
+      - name: Upload logs and summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: packaging-${{ matrix.label }}
+          path: |
+            fuzzlogs/
+            build/out/packaging/report/linux/summary.json
+            build/out/packaging/crash-*
+          if-no-files-found: ignore
